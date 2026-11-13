@@ -1,0 +1,975 @@
+/*
+ * =========================================================================
+ *        STUDENT ACADEMIC MANAGEMENT SYSTEM  (SAMS) 
+ * =========================================================================
+ *  Highlights:
+ *   - Masked password authentication (cross-platform: Windows & POSIX)
+ *   - Live academic metrics embedded in the main dashboard
+ *   - Dual-mode search (by Roll Number or partial Name match)
+ *   - Official Report Card viewer with 1-click Printable TXT Export
+ *   - Merit Ranking Board with podium highlights & visual SGPA bars
+ *   - Batch & Subject-level Analytics Dashboard with grade histogram
+ *   - Persistent file storage with auto-seeded demo records
+ *
+ *  Compile:  gcc -Wall -Wextra -o sams sams_pro.c
+ *  Run:      ./sams            (Windows: sams.exe)
+ *  Login:    admin / admin123
+ * =========================================================================
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <time.h>
+
+#ifdef _WIN32
+  #include <windows.h>
+  #include <conio.h>
+  #define SLEEP_MS(ms)   Sleep(ms)
+  #define CLEAR_SCREEN() system("cls")
+#else
+  #include <unistd.h>
+  #include <termios.h>
+  #define SLEEP_MS(ms)   usleep((ms) * 1000)
+  #define CLEAR_SCREEN() system("clear")
+#endif
+
+/* ---------- ANSI Colors ---------- */
+#define C_RESET   "\033[0m"
+#define C_BOLD    "\033[1m"
+#define C_DIM     "\033[2m"
+#define C_RED     "\033[31m"
+#define C_GREEN   "\033[32m"
+#define C_YELLOW  "\033[33m"
+#define C_BLUE    "\033[34m"
+#define C_MAGENTA "\033[35m"
+#define C_CYAN    "\033[36m"
+#define C_WHITE   "\033[97m"
+
+/* ---------- Limits & Constants ---------- */
+#define MAX_STUDENTS 100
+#define MAX_SUBJECTS 8
+#define NAME_LEN     50
+#define BRANCH_LEN   16
+#define CODE_LEN     12
+#define BOX_W        64
+#define DATA_FILE    "sams_database.txt"
+#define ADMIN_USER   "admin"
+#define ADMIN_PASS   "admin123"
+
+/* ---------- Data Structures ---------- */
+typedef struct {
+    char code[CODE_LEN];
+    char name[NAME_LEN];
+    int  credits;
+    int  marks;              /* 0 to 100 */
+} Subject;
+
+typedef struct {
+    int     roll;
+    char    name[NAME_LEN];
+    char    branch[BRANCH_LEN];
+    int     semester;
+    int     subjectCount;
+    Subject subjects[MAX_SUBJECTS];
+} Student;
+
+static Student db[MAX_STUDENTS];
+static int     studentCount = 0;
+
+/* ---------- 10-Point University Grading System ---------- */
+static const char *GRADE_LETTER[7] = {"O", "A+", "A", "B+", "B", "C", "F"};
+static const int   GRADE_POINT[7]  = {10,  9,    8,   7,    6,   5,   0};
+
+static int gradeIndex(int marks)
+{
+    if (marks >= 90) return 0;
+    if (marks >= 80) return 1;
+    if (marks >= 70) return 2;
+    if (marks >= 60) return 3;
+    if (marks >= 50) return 4;
+    if (marks >= 40) return 5;
+    return 6;
+}
+
+static const char *gradeColour(int marks)
+{
+    if (marks >= 70) return C_GREEN;
+    if (marks >= 40) return C_YELLOW;
+    return C_RED;
+}
+
+static const char *sgpaColour(float sgpa)
+{
+    if (sgpa >= 7.5f) return C_GREEN;
+    if (sgpa >= 5.0f) return C_YELLOW;
+    return C_RED;
+}
+
+static float calcSGPA(const Student *s)
+{
+    int credits = 0, points = 0;
+    for (int i = 0; i < s->subjectCount; i++) {
+        const Subject *sub = &s->subjects[i];
+        credits += sub->credits;
+        points  += sub->credits * GRADE_POINT[gradeIndex(sub->marks)];
+    }
+    return credits ? (float)points / (float)credits : 0.0f;
+}
+
+static int isPassing(const Student *s)
+{
+    for (int i = 0; i < s->subjectCount; i++)
+        if (s->subjects[i].marks < 40) return 0;
+    return 1;
+}
+
+static const char *classify(float sgpa)
+{
+    if (sgpa >= 9.0f) return "First Class with Distinction";
+    if (sgpa >= 7.5f) return "First Class";
+    if (sgpa >= 6.0f) return "Second Class";
+    if (sgpa >= 5.0f) return "Pass Class";
+    return "Needs Academic Improvement";
+}
+
+/* ---------- Cross-Platform Console & Input Helpers ---------- */
+static void enableConsoleColours(void)
+{
+#ifdef _WIN32
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD mode = 0;
+    if (GetConsoleMode(h, &mode))
+        SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+#endif
+}
+
+static void readLine(char *buf, int size)
+{
+    if (!fgets(buf, size, stdin)) {
+        printf("\n");
+        exit(0);
+    }
+    buf[strcspn(buf, "\r\n")] = '\0';
+}
+
+static void readPassword(char *buf, int size)
+{
+    int idx = 0;
+#ifdef _WIN32
+    int ch;
+    while ((ch = _getch()) != '\r' && ch != '\n') {
+        if (ch == '\b' || ch == 127) {
+            if (idx > 0) {
+                idx--;
+                printf("\b \b");
+            }
+        } else if (isprint(ch) && idx < size - 1) {
+            buf[idx++] = (char)ch;
+            putchar('*');
+        }
+    }
+#else
+    struct termios oldt, newt;
+    tcgetattr(STDIN_FILENO, &oldt);
+    newt = oldt;
+    newt.c_lflag &= ~(ECHO | ICANON);
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+
+    int ch;
+    while ((ch = getchar()) != '\n' && ch != '\r' && ch != EOF) {
+        if (ch == 127 || ch == '\b') {
+            if (idx > 0) {
+                idx--;
+                printf("\b \b");
+                fflush(stdout);
+            }
+        } else if (isprint(ch) && idx < size - 1) {
+            buf[idx++] = (char)ch;
+            putchar('*');
+            fflush(stdout);
+        }
+    }
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+#endif
+    buf[idx] = '\0';
+    putchar('\n');
+}
+
+static void ask(const char *prompt, char *buf, int size)
+{
+    printf(C_WHITE "%s" C_RESET, prompt);
+    readLine(buf, size);
+}
+
+static void askNonEmpty(const char *prompt, char *buf, int size)
+{
+    do {
+        ask(prompt, buf, size);
+        if (buf[0] == '\0')
+            printf(C_RED "  ! This field cannot be left blank.\n" C_RESET);
+    } while (buf[0] == '\0');
+}
+
+static int askInt(const char *prompt, int lo, int hi)
+{
+    char line[64];
+    int  value;
+    for (;;) {
+        ask(prompt, line, sizeof line);
+        if (sscanf(line, "%d", &value) == 1 && value >= lo && value <= hi)
+            return value;
+        printf(C_RED "  ! Invalid input. Enter an integer between %d and %d.\n" C_RESET, lo, hi);
+    }
+}
+
+static void waitEnter(void)
+{
+    char tmp[8];
+    printf(C_DIM "\n  Press [ENTER] to return to dashboard..." C_RESET);
+    readLine(tmp, sizeof tmp);
+}
+
+static void okMsg(const char *msg)  { printf(C_GREEN C_BOLD "  [SUCCESS] " C_RESET "%s\n", msg); }
+static void errMsg(const char *msg) { printf(C_RED   C_BOLD "  [ERROR]   " C_RESET "%s\n", msg); }
+static void infoMsg(const char *msg){ printf(C_CYAN  C_BOLD "  [INFO]    " C_RESET "%s\n", msg); }
+
+/*Case-insensitive substring search*/
+static int containsIgnoreCase(const char *haystack, const char *needle)
+{
+    if (!*needle) return 1;
+    for (; *haystack; haystack++) {
+        const char *h = haystack, *n = needle;
+        while (*h && *n && tolower((unsigned char)*h) == tolower((unsigned char)*n)) {
+            h++;
+            n++;
+        }
+        if (!*n) return 1;
+    }
+    return 0;
+}
+
+/* ---------- UI Box Drawing ---------- */
+static void boxRule(char c)
+{
+    printf("  +");
+    for (int i = 0; i < BOX_W; i++) putchar(c);
+    printf("+\n");
+}
+
+static void boxTitle(const char *title)
+{
+    int len = (int)strlen(title);
+    int left = (BOX_W - len) / 2;
+    int right = BOX_W - len - left;
+    printf("  |%*s%s%*s|\n", left, "", title, right, "");
+}
+
+static void boxRow(const char *text)
+{
+    char buf[BOX_W + 2];
+    snprintf(buf, sizeof buf, " %s", text);
+    printf("  |%-*.*s|\n", BOX_W, BOX_W, buf);
+}
+
+static void sectionHeader(const char *title, const char *subtitle)
+{
+    printf(C_CYAN C_BOLD);
+    boxRule('=');
+    boxTitle(title);
+    if (subtitle && subtitle[0]) {
+        printf(C_RESET C_DIM);
+        boxTitle(subtitle);
+        printf(C_RESET C_CYAN C_BOLD);
+    }
+    boxRule('=');
+    printf(C_RESET "\n");
+}
+
+/* ---------- Splash & Login ---------- */
+static void splash(void)
+{
+    CLEAR_SCREEN();
+    printf("\n\n");
+    printf(C_CYAN C_BOLD);
+    printf("      ____    _    __  __ ____  \n");
+    printf("     / ___|  / \\  |  \\/  / ___| \n");
+    printf("     \\___ \\ / _ \\ | |\\/| \\___ \\ \n");
+    printf("      ___) / ___ \\| |  | |___) |\n");
+    printf("     |____/_/   \\_\\_|  |_|____/   v2.0\n\n" C_RESET);
+
+    printf(C_WHITE C_BOLD "     STUDENT ACADEMIC MANAGEMENT SYSTEM\n" C_RESET);
+    printf(C_DIM "     B.Tech 1st Semester | Programming for Problem Solving (C)\n\n" C_RESET);
+
+    for (int p = 0; p <= 25; p++) {
+        printf("\r     Initializing modules [" C_GREEN);
+        for (int k = 0; k < 25; k++)
+            putchar(k < p ? '#' : '-');
+        printf(C_RESET "] %3d%%", p * 4);
+        fflush(stdout);
+        SLEEP_MS(35);
+    }
+    SLEEP_MS(300);
+}
+
+static int login(void)
+{
+    char user[32], pass[32];
+
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        CLEAR_SCREEN();
+        sectionHeader("ADMINISTRATOR AUTHENTICATION", "Authorized Faculty & Staff Access Only");
+        printf(C_DIM "  Hint -> Username: %s  |  Password: %s\n\n" C_RESET, ADMIN_USER, ADMIN_PASS);
+
+        ask("  Username : ", user, sizeof user);
+        printf(C_WHITE "  Password : " C_RESET);
+        readPassword(pass, sizeof pass);
+        printf("\n");
+
+        if (strcmp(user, ADMIN_USER) == 0 && strcmp(pass, ADMIN_PASS) == 0) {
+            okMsg("Identity verified. Loading workspace...");
+            SLEEP_MS(650);
+            return 1;
+        }
+        errMsg("Invalid username or password.");
+        if (attempt < 3)
+            printf(C_YELLOW "            Attempts left: %d\n" C_RESET, 3 - attempt);
+        SLEEP_MS(900);
+    }
+    return 0;
+}
+
+/* ---------- Database Persistence ---------- */
+static int fileLine(FILE *fp, char *buf, int size)
+{
+    if (!fgets(buf, size, fp)) {
+        buf[0] = '\0';
+        return 0;
+    }
+    buf[strcspn(buf, "\r\n")] = '\0';
+    return 1;
+}
+
+static int saveDatabase(void)
+{
+    FILE *fp = fopen(DATA_FILE, "w");
+    if (!fp) return 0;
+
+    fprintf(fp, "%d\n", studentCount);
+    for (int i = 0; i < studentCount; i++) {
+        const Student *s = &db[i];
+        fprintf(fp, "%d\n%s\n%s\n%d\n%d\n",
+                s->roll, s->name, s->branch, s->semester, s->subjectCount);
+        for (int j = 0; j < s->subjectCount; j++) {
+            const Subject *sub = &s->subjects[j];
+            fprintf(fp, "%s\n%s\n%d\n%d\n",
+                    sub->code, sub->name, sub->credits, sub->marks);
+        }
+    }
+    fclose(fp);
+    return 1;
+}
+
+static int loadDatabase(void)
+{
+    FILE *fp = fopen(DATA_FILE, "r");
+    char line[160];
+    if (!fp) return 0;
+
+    if (!fileLine(fp, line, sizeof line)) { fclose(fp); return 0; }
+    studentCount = atoi(line);
+    if (studentCount < 0) studentCount = 0;
+    if (studentCount > MAX_STUDENTS) studentCount = MAX_STUDENTS;
+
+    for (int i = 0; i < studentCount; i++) {
+        Student *s = &db[i];
+        fileLine(fp, line, sizeof line);          s->roll = atoi(line);
+        fileLine(fp, s->name, sizeof s->name);
+        fileLine(fp, s->branch, sizeof s->branch);
+        fileLine(fp, line, sizeof line);          s->semester = atoi(line);
+        fileLine(fp, line, sizeof line);          s->subjectCount = atoi(line);
+        if (s->subjectCount < 0) s->subjectCount = 0;
+        if (s->subjectCount > MAX_SUBJECTS) s->subjectCount = MAX_SUBJECTS;
+
+        for (int j = 0; j < s->subjectCount; j++) {
+            Subject *sub = &s->subjects[j];
+            fileLine(fp, sub->code, sizeof sub->code);
+            fileLine(fp, sub->name, sizeof sub->name);
+            fileLine(fp, line, sizeof line);      sub->credits = atoi(line);
+            fileLine(fp, line, sizeof line);      sub->marks   = atoi(line);
+        }
+    }
+    fclose(fp);
+    return 1;
+}
+
+static void seedDemoData(void)
+{
+    static const struct {
+        int         roll;
+        const char *name;
+        const char *branch;
+        int         marks[6];
+    } demo[5] = {
+        {2401, "Aarav Sharma", "CSE", {92, 88, 95, 81, 76, 70}},
+        {2402, "Diya Patel",   "CSE", {78, 84, 91, 69, 88, 85}},
+        {2403, "Rohan Verma",  "ECE", {55, 48, 62, 58, 71, 66}},
+        {2404, "Ananya Iyer",  "ME",  {38, 45, 50, 42, 60, 74}},
+        {2405, "Kabir Singh",  "CSE", {84, 79, 86, 73, 65, 80}},
+    };
+    static const char *codes[6]   = {"MA101", "PH101", "CS101", "EE101", "ME101", "HS101"};
+    static const char *names[6]   = {"Engineering Mathematics-I", "Engineering Physics",
+                                     "Programming in C", "Basic Electrical Engg",
+                                     "Engineering Graphics", "Communication Skills"};
+    static const int   credits[6] = {4, 4, 4, 3, 2, 2};
+
+    studentCount = 0;
+    for (int i = 0; i < 5; i++) {
+        Student *s = &db[studentCount++];
+        memset(s, 0, sizeof *s);
+        s->roll = demo[i].roll;
+        snprintf(s->name,   sizeof s->name,   "%s", demo[i].name);
+        snprintf(s->branch, sizeof s->branch, "%s", demo[i].branch);
+        s->semester     = 1;
+        s->subjectCount = 6;
+        for (int j = 0; j < 6; j++) {
+            Subject *sub = &s->subjects[j];
+            snprintf(sub->code, sizeof sub->code, "%s", codes[j]);
+            snprintf(sub->name, sizeof sub->name, "%s", names[j]);
+            sub->credits = credits[j];
+            sub->marks   = demo[i].marks[j];
+        }
+    }
+}
+
+static int findByRoll(int roll)
+{
+    for (int i = 0; i < studentCount; i++)
+        if (db[i].roll == roll) return i;
+    return -1;
+}
+
+/* ---------- Official Report Card & File Export ---------- */
+static void exportReportCardTxt(const Student *s)
+{
+    char filename[64];
+    snprintf(filename, sizeof filename, "ReportCard_%d.txt", s->roll);
+    FILE *fp = fopen(filename, "w");
+    if (!fp) {
+        errMsg("Could not create export file.");
+        return;
+    }
+
+    time_t now = time(NULL);
+    char dateStr[32];
+    strftime(dateStr, sizeof dateStr, "%d-%b-%Y %H:%M", localtime(&now));
+
+    float sgpa = calcSGPA(s);
+    int totalCredits = 0, totalMarks = 0;
+    for (int i = 0; i < s->subjectCount; i++) {
+        totalCredits += s->subjects[i].credits;
+        totalMarks   += s->subjects[i].marks;
+    }
+
+    fprintf(fp, "+================================================================+\n");
+    fprintf(fp, "|               OFFICIAL ACADEMIC GRADE TRANSCRIPT               |\n");
+    fprintf(fp, "+================================================================+\n");
+    fprintf(fp, "| Student Name : %-47s |\n", s->name);
+    fprintf(fp, "| Roll Number  : %-15d   Semester : %-17d |\n", s->roll, s->semester);
+    fprintf(fp, "| Department   : %-15s   Issued   : %-17s |\n", s->branch, dateStr);
+    fprintf(fp, "+----------------------------------------------------------------+\n");
+    fprintf(fp, "| %-8s %-28s %4s %6s %6s %5s |\n", "CODE", "COURSE TITLE", "CR", "MARKS", "GRADE", "GP");
+    fprintf(fp, "+----------------------------------------------------------------+\n");
+
+    for (int i = 0; i < s->subjectCount; i++) {
+        const Subject *sub = &s->subjects[i];
+        int gi = gradeIndex(sub->marks);
+        fprintf(fp, "| %-8s %-28.28s %4d %6d %6s %5d |\n",
+                sub->code, sub->name, sub->credits, sub->marks,
+                GRADE_LETTER[gi], GRADE_POINT[gi]);
+    }
+
+    fprintf(fp, "+----------------------------------------------------------------+\n");
+    fprintf(fp, "| Aggregate Marks : %d / %d    Total Credits : %d               |\n",
+            totalMarks, s->subjectCount * 100, totalCredits);
+    fprintf(fp, "| SGPA            : %.2f / 10.00                                 |\n", sgpa);
+    fprintf(fp, "| Division        : %-44s |\n", classify(sgpa));
+    fprintf(fp, "| Final Result    : %-44s |\n", isPassing(s) ? "PASSED" : "FAILED (Backlog)");
+    fprintf(fp, "+================================================================+\n");
+    fclose(fp);
+
+    char msg[96];
+    snprintf(msg, sizeof msg, "Printable mark sheet exported to '%s'", filename);
+    okMsg(msg);
+}
+
+static void reportCard(const Student *s)
+{
+    char line[128];
+    float sgpa = calcSGPA(s);
+    int totalCredits = 0, totalMarks = 0;
+    for (int i = 0; i < s->subjectCount; i++) {
+        totalCredits += s->subjects[i].credits;
+        totalMarks   += s->subjects[i].marks;
+    }
+
+    printf(C_CYAN C_BOLD);
+    boxRule('=');
+    boxTitle("OFFICIAL  ACADEMIC  GRADE  TRANSCRIPT");
+    boxRule('=');
+    printf(C_RESET);
+
+    snprintf(line, sizeof line, "Student Name : %s", s->name);
+    boxRow(line);
+    snprintf(line, sizeof line, "Roll Number  : %-12d   Department : %s", s->roll, s->branch);
+    boxRow(line);
+    snprintf(line, sizeof line, "Semester     : %-12d   Max Marks  : %d", s->semester, s->subjectCount * 100);
+    boxRow(line);
+
+    printf(C_CYAN);
+    boxRule('-');
+    printf(C_RESET);
+
+    printf(C_BOLD "  | %-8s %-28s %4s %6s %-6s %4s |\n" C_RESET,
+           "CODE", "SUBJECT", "CR", "MARKS", "GRADE", "GP");
+    printf(C_CYAN);
+    boxRule('-');
+    printf(C_RESET);
+
+    for (int i = 0; i < s->subjectCount; i++) {
+        const Subject *sub = &s->subjects[i];
+        int gi = gradeIndex(sub->marks);
+        printf("  | %-8s %-28.28s %4d %6d %s%-6s" C_RESET " %4d |\n",
+               sub->code, sub->name, sub->credits, sub->marks,
+               gradeColour(sub->marks), GRADE_LETTER[gi], GRADE_POINT[gi]);
+    }
+
+    printf(C_CYAN);
+    boxRule('-');
+    printf(C_RESET);
+
+    snprintf(line, sizeof line, "Marks Scored : %d / %d  (%.1f%%)   Credits : %d",
+             totalMarks, s->subjectCount * 100,
+             s->subjectCount ? (100.0f * totalMarks / (s->subjectCount * 100)) : 0.0f,
+             totalCredits);
+    boxRow(line);
+
+    printf("%s", sgpaColour(sgpa));
+    snprintf(line, sizeof line, "SGPA         : %.2f / 10.00   [%s]", sgpa, classify(sgpa));
+    boxRow(line);
+    printf(C_RESET);
+
+    snprintf(line, sizeof line, "Status       : %s",
+             isPassing(s) ? "PASSED" : "NOT CLEARED (Supplementary Required)");
+    boxRow(line);
+
+    printf(C_CYAN C_BOLD);
+    boxRule('=');
+    printf(C_RESET);
+
+    char choice[8];
+    ask("\n  Export printable report card to .txt file? (y/n): ", choice, sizeof choice);
+    if (tolower((unsigned char)choice[0]) == 'y')
+        exportReportCardTxt(s);
+}
+
+/* ---------- Core Modules ---------- */
+static void addStudent(void)
+{
+    Student s;
+    CLEAR_SCREEN();
+    sectionHeader("ENROLL NEW STUDENT", "Add Academic Record to Database");
+
+    if (studentCount >= MAX_STUDENTS) {
+        errMsg("Database capacity reached.");
+        waitEnter();
+        return;
+    }
+
+    memset(&s, 0, sizeof s);
+    s.roll = askInt("  Roll Number (1-99999) : ", 1, 99999);
+    if (findByRoll(s.roll) >= 0) {
+        errMsg("Duplicate roll number detected.");
+        waitEnter();
+        return;
+    }
+    askNonEmpty("  Full Name             : ", s.name, sizeof s.name);
+    askNonEmpty("  Branch (CSE/ECE/ME)   : ", s.branch, sizeof s.branch);
+    s.semester     = askInt("  Semester (1-8)        : ", 1, 8);
+    s.subjectCount = askInt("  Total Subjects (1-8)  : ", 1, MAX_SUBJECTS);
+
+    for (int i = 0; i < s.subjectCount; i++) {
+        Subject *sub = &s.subjects[i];
+        printf(C_CYAN C_BOLD "\n  [Subject %d of %d]\n" C_RESET, i + 1, s.subjectCount);
+        askNonEmpty("  Course Code           : ", sub->code, sizeof sub->code);
+        askNonEmpty("  Course Title          : ", sub->name, sizeof sub->name);
+        sub->credits = askInt("  Credits (1-6)         : ", 1, 6);
+        sub->marks   = askInt("  Marks Obtained (0-100): ", 0, 100);
+    }
+
+    db[studentCount++] = s;
+    saveDatabase();
+    printf("\n");
+    okMsg("Student enrolled and committed to storage.");
+    waitEnter();
+}
+
+static void viewAll(void)
+{
+    CLEAR_SCREEN();
+    sectionHeader("STUDENT DIRECTORY", "Complete Enrolled Roster");
+
+    if (studentCount == 0) {
+        errMsg("No student records available.");
+        waitEnter();
+        return;
+    }
+
+    printf(C_BOLD C_CYAN "  %-6s %-22s %-8s %-4s %-7s %s\n" C_RESET,
+           "ROLL", "STUDENT NAME", "BRANCH", "SEM", "SGPA", "RESULT");
+    printf(C_DIM "  ------------------------------------------------------------------\n" C_RESET);
+
+    for (int i = 0; i < studentCount; i++) {
+        const Student *s = &db[i];
+        float sg = calcSGPA(s);
+        const char *status = isPassing(s) ? C_GREEN "PASS" : C_RED "FAIL";
+        printf("  %-6d %-22.22s %-8.8s %-4d %s%-7.2f" C_RESET " %s" C_RESET "\n",
+               s->roll, s->name, s->branch, s->semester,
+               sgpaColour(sg), sg, status);
+    }
+    printf(C_DIM "  ------------------------------------------------------------------\n" C_RESET);
+    printf("  Total Records: " C_BOLD "%d\n" C_RESET, studentCount);
+    waitEnter();
+}
+
+static void searchStudent(void)
+{
+    char query[NAME_LEN];
+    CLEAR_SCREEN();
+    sectionHeader("SEARCH & REPORT CARD", "Lookup by Roll Number or Student Name");
+
+    askNonEmpty("  Enter Roll Number or Name: ", query, sizeof query);
+
+    /* Check if numeric roll number */
+    int rollQuery = 0;
+    if (sscanf(query, "%d", &rollQuery) == 1 && rollQuery > 0) {
+        int idx = findByRoll(rollQuery);
+        if (idx >= 0) {
+            printf("\n");
+            reportCard(&db[idx]);
+            waitEnter();
+            return;
+        }
+    }
+
+    /* Fallback to partial case-insensitive name match */
+    int matches[MAX_STUDENTS], matchCount = 0;
+    for (int i = 0; i < studentCount; i++) {
+        if (containsIgnoreCase(db[i].name, query))
+            matches[matchCount++] = i;
+    }
+
+    if (matchCount == 0) {
+        printf("\n");
+        errMsg("No matching student found.");
+        waitEnter();
+        return;
+    }
+
+    if (matchCount == 1) {
+        printf("\n");
+        reportCard(&db[matches[0]]);
+        waitEnter();
+        return;
+    }
+
+    printf(C_YELLOW "\n  Multiple matches found:\n" C_RESET);
+    for (int m = 0; m < matchCount; m++) {
+        int idx = matches[m];
+        printf("   %d) [%d] %s (%s)\n", m + 1, db[idx].roll, db[idx].name, db[idx].branch);
+    }
+    int pick = askInt("\n  Select student number to view report card: ", 1, matchCount);
+    printf("\n");
+    reportCard(&db[matches[pick - 1]]);
+    waitEnter();
+}
+
+static void updateMarks(void)
+{
+    CLEAR_SCREEN();
+    sectionHeader("MODIFY SUBJECT MARKS", "Update Assessment Scores");
+
+    int roll = askInt("  Enter Roll Number: ", 1, 99999);
+    int i = findByRoll(roll);
+    if (i < 0) {
+        errMsg("Student record not found.");
+        waitEnter();
+        return;
+    }
+
+    Student *s = &db[i];
+    printf(C_BOLD "\n  Transcript for %s (Roll: %d):\n" C_RESET, s->name, s->roll);
+    for (int j = 0; j < s->subjectCount; j++) {
+        printf("   %d) [%-5s] %-26.26s -> Current: %s%3d\n" C_RESET,
+               j + 1, s->subjects[j].code, s->subjects[j].name,
+               gradeColour(s->subjects[j].marks), s->subjects[j].marks);
+    }
+
+    int k = askInt("\n  Select subject number to edit : ", 1, s->subjectCount);
+    int m = askInt("  Enter revised marks (0-100)   : ", 0, 100);
+    s->subjects[k - 1].marks = m;
+    saveDatabase();
+
+    printf("\n");
+    okMsg("Marks updated and SGPA recalculated.");
+    waitEnter();
+}
+
+static void deleteStudent(void)
+{
+    char answer[8];
+    CLEAR_SCREEN();
+    sectionHeader("REMOVE STUDENT RECORD", "Permanent Database Deletion");
+
+    int roll = askInt("  Enter Roll Number: ", 1, 99999);
+    int i = findByRoll(roll);
+    if (i < 0) {
+        errMsg("Student record not found.");
+        waitEnter();
+        return;
+    }
+
+    printf(C_YELLOW "\n  Target Record : %s | Roll: %d | Branch: %s\n" C_RESET,
+           db[i].name, db[i].roll, db[i].branch);
+    ask("  Confirm permanent deletion? (y/n): ", answer, sizeof answer);
+
+    if (tolower((unsigned char)answer[0]) == 'y') {
+        memmove(&db[i], &db[i + 1], sizeof(Student) * (size_t)(studentCount - i - 1));
+        studentCount--;
+        saveDatabase();
+        printf("\n");
+        okMsg("Record permanently removed.");
+    } else {
+        printf("\n");
+        infoMsg("Operation aborted. No changes made.");
+    }
+    waitEnter();
+}
+
+static void ranking(void)
+{
+    int   order[MAX_STUDENTS];
+    float sg[MAX_STUDENTS];
+
+    CLEAR_SCREEN();
+    sectionHeader("MERIT LEADERBOARD", "Ranked by Semester Grade Point Average");
+
+    if (studentCount == 0) {
+        errMsg("No records available.");
+        waitEnter();
+        return;
+    }
+
+    for (int i = 0; i < studentCount; i++) {
+        order[i] = i;
+        sg[i] = calcSGPA(&db[i]);
+    }
+
+    for (int i = 0; i < studentCount - 1; i++) {
+        for (int j = 0; j < studentCount - 1 - i; j++) {
+            if (sg[order[j]] < sg[order[j + 1]]) {
+                int tmp = order[j];
+                order[j] = order[j + 1];
+                order[j + 1] = tmp;
+            }
+        }
+    }
+
+    printf(C_BOLD C_CYAN "  %-6s %-22s %-6s %-7s %s\n" C_RESET,
+           "RANK", "NAME", "ROLL", "SGPA", "VISUAL SCALE");
+    printf(C_DIM "  ------------------------------------------------------------------\n" C_RESET);
+
+    for (int r = 0; r < studentCount; r++) {
+        int i = order[r];
+        const char *medal = (r == 0) ? C_YELLOW "#1" :
+                            (r == 1) ? C_WHITE  "#2" :
+                            (r == 2) ? C_MAGENTA "#3" : C_DIM "  ";
+        int bars = (int)(sg[i] * 2.5f);
+
+        printf("  %s %-3d" C_RESET " %-22.22s %-6d %s%-7.2f" C_RESET " ",
+               medal, r + 1, db[i].name, db[i].roll, sgpaColour(sg[i]), sg[i]);
+
+        printf("%s", sgpaColour(sg[i]));
+        for (int b = 0; b < bars; b++) putchar('#');
+        printf(C_RESET "\n");
+    }
+    waitEnter();
+}
+
+static void analytics(void)
+{
+    int   gradeCount[7] = {0};
+    float sum = 0.0f, best = -1.0f, worst = 11.0f;
+    int   bestIdx = 0, passed = 0;
+
+    /* Track subject-wise averages */
+    char  subNames[32][NAME_LEN];
+    int   subTotals[32] = {0}, subCounts[32] = {0}, uniqueSubs = 0;
+
+    CLEAR_SCREEN();
+    sectionHeader("ACADEMIC ANALYTICS", "Batch Performance & Grade Distribution");
+
+    if (studentCount == 0) {
+        errMsg("No records available.");
+        waitEnter();
+        return;
+    }
+
+    for (int i = 0; i < studentCount; i++) {
+        const Student *s = &db[i];
+        float g = calcSGPA(s);
+        sum += g;
+        if (g > best)  { best = g; bestIdx = i; }
+        if (g < worst) worst = g;
+        if (isPassing(s)) passed++;
+
+        for (int j = 0; j < s->subjectCount; j++) {
+            const Subject *sub = &s->subjects[j];
+            gradeCount[gradeIndex(sub->marks)]++;
+
+            int found = -1;
+            for (int u = 0; u < uniqueSubs; u++) {
+                if (strcmp(subNames[u], sub->name) == 0) { found = u; break; }
+            }
+            if (found < 0 && uniqueSubs < 32) {
+                found = uniqueSubs++;
+                snprintf(subNames[found], NAME_LEN, "%s", sub->name);
+            }
+            if (found >= 0) {
+                subTotals[found] += sub->marks;
+                subCounts[found]++;
+            }
+        }
+    }
+
+    printf("  Enrolled Strength   : " C_BOLD "%d Students\n" C_RESET, studentCount);
+    printf("  Batch Average SGPA  : " C_BOLD C_GREEN "%.2f / 10.00\n" C_RESET, sum / studentCount);
+    printf("  Batch Topper        : " C_BOLD "%s" C_RESET " (SGPA: %.2f)\n", db[bestIdx].name, best);
+    printf("  Lowest SGPA         : " C_BOLD C_YELLOW "%.2f\n" C_RESET, worst);
+    printf("  Overall Pass Rate   : " C_BOLD C_CYAN "%.1f%%" C_RESET " (%d/%d passed)\n",
+           100.0f * passed / studentCount, passed, studentCount);
+
+    if (uniqueSubs > 0) {
+        int topSub = 0, lowSub = 0;
+        for (int u = 1; u < uniqueSubs; u++) {
+            float avgU = (float)subTotals[u] / subCounts[u];
+            if (avgU > (float)subTotals[topSub] / subCounts[topSub]) topSub = u;
+            if (avgU < (float)subTotals[lowSub] / subCounts[lowSub]) lowSub = u;
+        }
+        printf("  Highest Avg Subject : " C_GREEN "%s" C_RESET " (%.1f%%)\n",
+               subNames[topSub], (float)subTotals[topSub] / subCounts[topSub]);
+        printf("  Toughest Subject    : " C_RED "%s" C_RESET " (%.1f%%)\n",
+               subNames[lowSub], (float)subTotals[lowSub] / subCounts[lowSub]);
+    }
+
+    printf(C_BOLD "\n  Grade Histogram (Across All Subjects)\n" C_RESET);
+    int maxCount = 1;
+    for (int k = 0; k < 7; k++)
+        if (gradeCount[k] > maxCount) maxCount = gradeCount[k];
+
+    for (int k = 0; k < 7; k++) {
+        char bar[33];
+        int len = gradeCount[k] * 32 / maxCount;
+        memset(bar, '#', (size_t)len);
+        bar[len] = '\0';
+        const char *col = (k <= 2) ? C_GREEN : (k <= 4) ? C_YELLOW : C_RED;
+        printf("  %-3s | %s%-32s" C_RESET " (%d)\n", GRADE_LETTER[k], col, bar, gradeCount[k]);
+    }
+    waitEnter();
+}
+
+/* ---------- Main Dashboard ---------- */
+static void menuItem(int n, const char *label)
+{
+    printf("  |  " C_YELLOW "[%d]" C_RESET " %-58s|\n", n, label);
+}
+
+static void showMenu(void)
+{
+    char status[96];
+    float avgSgpa = 0.0f;
+    int passCount = 0;
+
+    for (int i = 0; i < studentCount; i++) {
+        avgSgpa += calcSGPA(&db[i]);
+        if (isPassing(&db[i])) passCount++;
+    }
+    if (studentCount > 0) avgSgpa /= studentCount;
+
+    CLEAR_SCREEN();
+    printf(C_BLUE C_BOLD);
+    boxRule('=');
+    boxTitle("S A M S   v2.0   -   A C A D E M I C   D A S H B O A R D");
+    boxRule('=');
+    printf(C_RESET);
+
+    snprintf(status, sizeof status, "Students: %d/%d  |  Avg SGPA: %.2f  |  Pass Rate: %.0f%%",
+             studentCount, MAX_STUDENTS, avgSgpa,
+             studentCount ? (100.0f * passCount / studentCount) : 0.0f);
+    boxRow(status);
+
+    printf(C_BLUE);
+    boxRule('-');
+    printf(C_RESET);
+
+    menuItem(1, "Enroll New Student");
+    menuItem(2, "View Student Roster");
+    menuItem(3, "Search & Generate Official Report Card");
+    menuItem(4, "Modify Subject Marks");
+    menuItem(5, "Remove Student Record");
+    menuItem(6, "Merit Leaderboard");
+    menuItem(7, "Batch & Subject Analytics");
+    menuItem(0, "Save & Exit System");
+
+    printf(C_BLUE);
+    boxRule('=');
+    printf(C_RESET "\n");
+}
+
+int main(void)
+{
+    enableConsoleColours();
+    splash();
+
+    if (!login()) {
+        printf(C_RED "\n  Security lockout: Maximum login attempts exceeded.\n\n" C_RESET);
+        return 1;
+    }
+
+    if (!loadDatabase()) {
+        seedDemoData();
+        saveDatabase();
+    }
+
+    for (;;) {
+        showMenu();
+        switch (askInt("  Select an action [0-7]: ", 0, 7)) {
+            case 1: addStudent();    break;
+            case 2: viewAll();       break;
+            case 3: searchStudent(); break;
+            case 4: updateMarks();   break;
+            case 5: deleteStudent(); break;
+            case 6: ranking();       break;
+            case 7: analytics();     break;
+            case 0:
+                saveDatabase();
+                CLEAR_SCREEN();
+                printf(C_CYAN C_BOLD "\n  All changes committed to '%s'.\n" C_RESET, DATA_FILE);
+                printf(C_GREEN "  Session closed safely. Goodbye!\n\n" C_RESET);
+                return 0;
+            default:
+                break;
+        }
+    }
+}
